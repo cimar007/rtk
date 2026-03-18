@@ -20,9 +20,10 @@ pub fn maybe_ping() {
         return;
     }
 
-    // Check opt-out: config.toml
-    if let Some(false) = config::telemetry_enabled() {
-        return;
+    // Telemetry is opt-in: only proceed if config explicitly enables it
+    match config::telemetry_enabled() {
+        Some(true) => {} // explicitly enabled, continue
+        _ => return,     // None (error) or Some(false) = disabled by default
     }
 
     // Check last ping time

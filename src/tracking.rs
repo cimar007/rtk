@@ -31,6 +31,8 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use lazy_static::lazy_static;
+use regex::Regex;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::ffi::OsString;
@@ -63,6 +65,35 @@ fn project_filter_params(project_path: Option<&str>) -> (Option<String>, Option<
 
 /// Number of days to retain tracking history before automatic cleanup.
 const HISTORY_DAYS: i64 = 90;
+
+// ── Command redaction ── //
+
+lazy_static! {
+    /// Matches CLI flags with sensitive names: --token=VALUE, --secret VALUE, etc.
+    static ref SENSITIVE_FLAG_RE: Regex = Regex::new(
+        r"(?i)(--?(?:token|key|secret|password|auth|credential|jwt|api[_-]?key|access[_-]?key|private))[=\s]+(\S+)"
+    ).unwrap();
+
+    /// Matches Authorization headers: -H "Authorization: Bearer TOKEN"
+    static ref SENSITIVE_HEADER_RE: Regex = Regex::new(
+        r#"(?i)(-H\s+["']?(?:Authorization:\s*\S+\s+))(\S+)(["']?)"#
+    ).unwrap();
+
+    /// Matches env-style assignments: API_KEY=sk-123, SECRET_TOKEN=abc
+    static ref SENSITIVE_ENV_RE: Regex = Regex::new(
+        r"(?i)\b(\w*(?:token|key|secret|password|auth|credential|jwt|api[_-]?key|access[_-]?key|private)\w*)=(\S+)"
+    ).unwrap();
+}
+
+/// Redact sensitive values from command strings before storing in the database.
+/// Detects CLI flags, HTTP headers, and env-style assignments containing
+/// sensitive keywords (token, key, secret, password, auth, credential, etc.).
+fn redact_command(cmd: &str) -> String {
+    let result = SENSITIVE_FLAG_RE.replace_all(cmd, "$1=[REDACTED]");
+    let result = SENSITIVE_HEADER_RE.replace_all(&result, "$1[REDACTED]$3");
+    let result = SENSITIVE_ENV_RE.replace_all(&result, "$1=[REDACTED]");
+    result.into_owned()
+}
 
 /// Main tracking interface for recording and querying command history.
 ///
@@ -364,16 +395,18 @@ impl Tracker {
             0.0
         };
 
-        let project_path = current_project_path_string(); // added: record cwd
+        let project_path = current_project_path_string();
+        let original_cmd_safe = redact_command(original_cmd);
+        let rtk_cmd_safe = redact_command(rtk_cmd);
 
         self.conn.execute(
             "INSERT INTO commands (timestamp, original_cmd, rtk_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", // added: project_path
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 Utc::now().to_rfc3339(),
-                original_cmd,
-                rtk_cmd,
-                project_path, // added
+                original_cmd_safe,
+                rtk_cmd_safe,
+                project_path,
                 input_tokens as i64,
                 output_tokens as i64,
                 saved as i64,
@@ -406,12 +439,13 @@ impl Tracker {
         error_message: &str,
         fallback_succeeded: bool,
     ) -> Result<()> {
+        let raw_command_safe = redact_command(raw_command);
         self.conn.execute(
             "INSERT INTO parse_failures (timestamp, raw_command, error_message, fallback_succeeded)
              VALUES (?1, ?2, ?3, ?4)",
             params![
                 Utc::now().to_rfc3339(),
-                raw_command,
+                raw_command_safe,
                 error_message,
                 fallback_succeeded as i32,
             ],
@@ -1425,5 +1459,57 @@ mod tests {
         // We can't assert exact rate because other tests may have added records,
         // but we can verify recovery_rate is between 0 and 100
         assert!(summary.recovery_rate >= 0.0 && summary.recovery_rate <= 100.0);
+    }
+
+    // ── Redaction tests ── //
+
+    #[test]
+    fn test_redact_bearer_token() {
+        let cmd = r#"curl -H "Authorization: Bearer abc123secret" https://api.example.com"#;
+        let redacted = redact_command(cmd);
+        assert!(!redacted.contains("abc123secret"), "Bearer token not redacted");
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(redacted.contains("https://api.example.com"));
+    }
+
+    #[test]
+    fn test_redact_flag_equals() {
+        let cmd = "mycli --token=supersecret --verbose";
+        let redacted = redact_command(cmd);
+        assert!(!redacted.contains("supersecret"), "Token value not redacted");
+        assert!(redacted.contains("--token=[REDACTED]"));
+        assert!(redacted.contains("--verbose"));
+    }
+
+    #[test]
+    fn test_redact_env_style() {
+        let cmd = "API_KEY=sk-12345 npm start";
+        let redacted = redact_command(cmd);
+        assert!(!redacted.contains("sk-12345"), "API key not redacted");
+        assert!(redacted.contains("API_KEY=[REDACTED]"));
+        assert!(redacted.contains("npm start"));
+    }
+
+    #[test]
+    fn test_redact_password_flag() {
+        let cmd = "mysql --password=mypass123 -u root";
+        let redacted = redact_command(cmd);
+        assert!(!redacted.contains("mypass123"), "Password not redacted");
+        assert!(redacted.contains("--password=[REDACTED]"));
+    }
+
+    #[test]
+    fn test_no_redaction_for_safe_commands() {
+        let cmd = "git log --oneline -10";
+        assert_eq!(redact_command(cmd), cmd);
+    }
+
+    #[test]
+    fn test_redact_multiple_sensitive_values() {
+        let cmd = "deploy --token=abc123 --secret=xyz789 --region us-east-1";
+        let redacted = redact_command(cmd);
+        assert!(!redacted.contains("abc123"));
+        assert!(!redacted.contains("xyz789"));
+        assert!(redacted.contains("--region us-east-1"));
     }
 }

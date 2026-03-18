@@ -5,35 +5,30 @@ use regex::Regex;
 use std::process::{Command, Stdio};
 
 /// Run a command and provide a heuristic summary
-pub fn run(command: &str, verbose: u8) -> Result<()> {
+pub fn run(command: &[String], verbose: u8) -> Result<()> {
+    anyhow::ensure!(!command.is_empty(), "No command provided to rtk summary");
+
+    let cmd_display = command.join(" ");
     let timer = tracking::TimedExecution::start();
 
     if verbose > 0 {
-        eprintln!("Running and summarizing: {}", command);
+        eprintln!("Running and summarizing: {}", cmd_display);
     }
 
-    let output = if cfg!(target_os = "windows") {
-        Command::new("cmd")
-            .args(["/C", command])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-    } else {
-        Command::new("sh")
-            .args(["-c", command])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-    }
-    .context("Failed to execute command")?;
+    let output = Command::new(&command[0])
+        .args(&command[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("Failed to execute command: {}", command[0]))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let raw = format!("{}\n{}", stdout, stderr);
 
-    let summary = summarize_output(&raw, command, output.status.success());
+    let summary = summarize_output(&raw, &cmd_display, output.status.success());
     println!("{}", summary);
-    timer.track(command, "rtk summary", &raw, &summary);
+    timer.track(&cmd_display, "rtk summary", &raw, &summary);
     Ok(())
 }
 

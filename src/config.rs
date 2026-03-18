@@ -92,7 +92,7 @@ pub struct TelemetryConfig {
 
 impl Default for TelemetryConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self { enabled: false }
     }
 }
 
